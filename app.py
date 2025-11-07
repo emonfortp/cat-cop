@@ -1,9 +1,5 @@
-# app.py — Catalyst Copilot v0.4 (fixed ASCII-safe version)
-# - Cards → Watchlist (ranked)
-# - EV math (per-card & per-position)
-# - Portfolio uploader & EV aggregation
-# - Reinvest planner
-# - CSV import/export + templates
+# app.py — Catalyst Copilot v0.4.1 (KeyError-hardened, ASCII-safe)
+# Cards → Watchlist (ranked) → EV math → Portfolio EV → Reinvest planner
 
 import io
 import math
@@ -12,7 +8,7 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, date
 
-st.set_page_config(page_title="Catalyst Copilot v0.4", layout="wide")
+st.set_page_config(page_title="Catalyst Copilot v0.4.1", layout="wide")
 
 # ---------- Helpers ----------
 def _to_float(x, default=np.nan):
@@ -49,7 +45,6 @@ def _norm_probs_row(r):
         index=["p_bull", "p_base", "p_bear"],
     )
     if p.isna().any():
-        # fallback to priors if any missing
         p = pd.Series([0.35, 0.45, 0.20], index=["p_bull", "p_base", "p_bear"])
     s = p.sum()
     if s <= 0 or not np.isfinite(s):
@@ -74,8 +69,8 @@ def _ev_from_row(r):
     return ev_sh, ev_pct
 
 def _odds_row(r):
-    up = max(_to_float(r.get("t_bull")) - _to_float(r.get("price")), 0.0) * r["p_bull"]
-    down = max(_to_float(r.get("price")) - _to_float(r.get("t_bear")), 0.0) * r["p_bear"]
+    up = max(_to_float(r.get("t_bull")) - _to_float(r.get("price")), 0.0) * r.get("p_bull", 0.35)
+    down = max(_to_float(r.get("price")) - _to_float(r.get("t_bear")), 0.0) * r.get("p_bear", 0.20)
     if down <= 0:
         return 99.0
     return float(np.clip(up / (down + 1e-9), 0, 99))
@@ -90,8 +85,13 @@ if "cards" not in st.session_state:
 if "cash" not in st.session_state:
     st.session_state.cash = 0.0
 if "positions" not in st.session_state:
-    # ticker, shares, avg, price
     st.session_state.positions = pd.DataFrame(columns=["ticker", "shares", "avg", "price"])
+
+# Ensure cards dataframe has expected columns, even when empty
+EXPECTED_CARD_COLS = ["ticker","type","date","price",
+                      "t_bull","t_base","t_bear",
+                      "p_bull","p_base","p_bear",
+                      "news","flow","conf"]
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -110,6 +110,9 @@ with st.sidebar:
     if st.button("Add/Update Position"):
         if pt and psh >= 0:
             df = st.session_state.positions.copy()
+            for col in ["ticker","shares","avg","price"]:
+                if col not in df.columns:
+                    df[col] = pd.Series(dtype=float if col != "ticker" else str)
             mask = df["ticker"] == pt
             if mask.any():
                 df.loc[mask, ["shares", "avg", "price"]] = [psh, pav, pcp]
@@ -128,8 +131,8 @@ with st.sidebar:
         st.info("Positions cleared.")
 
 # ---------- Header ----------
-st.title("🧠 Catalyst Copilot — v0.4 (fixed)")
-st.caption("Cards → Watchlist (ranked) → EV math → Portfolio EV → Reinvest planner.")
+st.title("🧠 Catalyst Copilot — v0.4.1")
+st.caption("Cards → Watchlist (ranked) → EV math → Portfolio EV → Reinvest planner (hardened for empty states).")
 
 # ---------- Cards ----------
 st.header("Catalyst Cards — add & rank")
@@ -176,10 +179,17 @@ if st.button("Add Card", type="primary"):
         st.session_state.cards.append(card)
         st.success(f"Card added for {ticker}")
 
+# Build watchlist safely
 wl = pd.DataFrame(st.session_state.cards)
+for col in EXPECTED_CARD_COLS:
+    if col not in wl.columns:
+        wl[col] = np.nan
+
 if not wl.empty:
     wl = wl.apply(_norm_probs_row, axis=1)
-    wl["dte"] = wl["date"].apply(_parse_date).apply(lambda d: (pd.to_datetime(d) - pd.Timestamp.today().normalize()).days if d else np.nan)
+    wl["dte"] = wl["date"].apply(_parse_date).apply(
+        lambda d: (pd.to_datetime(d) - pd.Timestamp.today().normalize()).days if d else np.nan
+    )
     ev_sh, ev_pct, odds = [], [], []
     for _, r in wl.iterrows():
         es, ep = _ev_from_row(r)
@@ -191,8 +201,12 @@ if not wl.empty:
 st.subheader("Catalyst Watchlist (ranked)")
 show_cols = ["ticker","type","date","dte","price","t_bull","t_base","t_bear",
              "p_bull","p_base","p_bear","ev_sh","ev_pct","odds"]
-st.dataframe(wl[show_cols], use_container_width=True)
-_download_csv_button(wl, "Download Watchlist (with EV)", "watchlist_ev.csv")
+if wl.empty:
+    st.info("No cards yet. Add a card to see rankings.")
+    st.dataframe(pd.DataFrame(columns=show_cols), use_container_width=True)
+else:
+    st.dataframe(wl[show_cols], use_container_width=True)
+    _download_csv_button(wl[show_cols], "Download Watchlist (with EV)", "watchlist_ev.csv")
 
 st.markdown("---")
 
@@ -200,21 +214,28 @@ st.markdown("---")
 st.header("📊 Portfolio — EV & Reinvest Plan")
 
 pos = st.session_state.positions.copy()
+for col in ["ticker","shares","avg","price"]:
+    if col not in pos.columns:
+        pos[col] = pd.Series(dtype=float if col != "ticker" else str)
+
 for c in ["shares", "avg", "price"]:
-    if c in pos.columns:
-        pos[c] = pos[c].apply(_to_float)
+    pos[c] = pos[c].apply(_to_float)
 
 if not pos.empty:
+    pos["ticker"] = pos["ticker"].astype(str).str.upper()
     pos["price"] = np.where(pos["price"].isna() | (pos["price"] <= 0), pos["avg"], pos["price"])
+
     ev_map = {}
     if not wl.empty:
         best = wl.sort_values(["ticker", "rank_score"], ascending=[True, False]).drop_duplicates(subset=["ticker"])
         ev_map = {r["ticker"]: r["ev_pct"] for _, r in best.iterrows()}
+
     pos["EV_%"] = pos["ticker"].map(ev_map).fillna(0.0)
     pos["MktVal_EUR"] = pos["shares"] * pos["price"]
     pos["EV_EUR"] = pos["MktVal_EUR"] * pos["EV_%"] / 100.0
 
-    st.dataframe(pos[["ticker", "shares", "avg", "price", "MktVal_EUR", "EV_%", "EV_EUR"]], use_container_width=True)
+    st.dataframe(pos[["ticker","shares","avg","price","MktVal_EUR","EV_%","EV_EUR"]],
+                 use_container_width=True)
 
     mv = pos["MktVal_EUR"].sum()
     sum_ev = pos["EV_EUR"].sum()
@@ -225,9 +246,11 @@ if not pos.empty:
 else:
     st.info("No positions yet. Add or upload a CSV.")
 
+# ---------- Reinvest Planner ----------
 st.subheader("🔁 Reinvest Planner")
 r = st.slider("Reinvest rate r (0–100%)", min_value=0, max_value=100, value=60, step=5)
-budget = st.number_input("Budget (€)", value=float(round(st.session_state.cash * r / 100.0, 2)), step=50.0)
+default_budget = round(st.session_state.cash * r / 100.0, 2)
+budget = st.number_input("Budget (€)", value=float(default_budget), step=50.0)
 st.caption("Sizing ∝ max(0, odds × EV%) under your budget.")
 
 alloc_tbl = pd.DataFrame(columns=["ticker","price","ev_pct","odds","alloc_EUR","buy_shares"])
@@ -239,7 +262,7 @@ if not wl.empty and budget > 0:
         if score.sum() > 0:
             w = score / score.sum()
             alloc_EUR = w * budget
-            pr = cands["price"].apply(_to_float).fillna(0.0).replace(0, np.nan)
+            pr = cands["price"].apply(_to_float).replace(0, np.nan)
             buy = np.floor(alloc_EUR / pr).fillna(0).astype(int)
             alloc_tbl = pd.DataFrame({
                 "ticker": cands["ticker"].values,
@@ -254,4 +277,4 @@ st.dataframe(alloc_tbl, use_container_width=True)
 _download_csv_button(alloc_tbl, "Download Reinvest Plan", "reinvest_plan.csv")
 
 st.markdown("---")
-st.caption("v0.4 — unified & ASCII-safe: per-card & per-position EV, CSV ingest, reinvest planner, validated math.")
+st.caption("v0.4.1 — hardened: no KeyErrors on empty tables; EV math & planner intact.")
