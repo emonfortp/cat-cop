@@ -1,349 +1,356 @@
-# app.py — Catalyst Copilot v0.4.2 (IBKR PortfolioAnalyst Import + QC)
-# --------------------------------------------------------------------
-import streamlit as st
-import pandas as pd
+# app.py
+# Catalyst EV Calculator — unified single-file Streamlit app
+# Paste into Streamlit, then run: streamlit run app.py
+
+import io
 import numpy as np
-from datetime import date, datetime
+import pandas as pd
+import streamlit as st
 
-st.set_page_config(page_title="Catalyst Copilot", layout="wide")
+st.set_page_config(page_title="Catalyst EV Calculator", layout="wide")
 
-# --- State ---
+# -------------------------
+# Helpers (parsing & mapping)
+# -------------------------
+def _num_series(s):
+    return pd.to_numeric(s, errors="coerce")
+
+def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+def _map_positions_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Accept a variety of headers and map them into:
+    ticker, shares, avg, price
+    """
+    df = _clean_cols(df_raw)
+    # Candidate headers for each target
+    cand = {
+        "ticker": ["ticker","symbol","sym","asset","security","instrument"],
+        "shares": ["shares","qty","quantity","position","units"],
+        "avg":    ["avg","avgcost","avg_cost","averagecost","average_cost","cost_basis","avg price","average price"],
+        "price":  ["price","last","mktprice","marketprice","close","px","current price"]
+    }
+
+    out = pd.DataFrame()
+    # TICKER required
+    for k in cand["ticker"]:
+        if k in df.columns:
+            out["ticker"] = df[k]
+            break
+    if "ticker" not in out.columns:
+        raise ValueError("Positions CSV error: missing 'ticker' (aka symbol).")
+
+    # SHARES required
+    for k in cand["shares"]:
+        if k in df.columns:
+            out["shares"] = _num_series(df[k])
+            break
+    if "shares" not in out.columns:
+        raise ValueError("Positions CSV error: missing 'shares' (aka qty).")
+
+    # AVG optional
+    for k in cand["avg"]:
+        if k in df.columns:
+            out["avg"] = _num_series(df[k])
+            break
+    if "avg" not in out.columns:
+        out["avg"] = np.nan
+
+    # PRICE optional (we can use avg as fallback later)
+    for k in cand["price"]:
+        if k in df.columns:
+            out["price"] = _num_series(df[k])
+            break
+    if "price" not in out.columns:
+        out["price"] = np.nan
+
+    # normalize tickers
+    out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
+    # drop rows with no shares or no ticker
+    out = out.dropna(subset=["ticker","shares"])
+    out["shares"] = out["shares"].astype(float)
+    return out
+
+def _map_cards_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Accept a variety of headers and map them into the minimal schema:
+    ticker, t_bull, t_base, t_bear, p_bull, p_base, p_bear, last(optional)
+    """
+    df = _clean_cols(df_raw)
+    def pick(df, names, required=True, default=np.nan):
+        for n in names:
+            if n in df.columns:
+                return _num_series(df[n]) if df[n].dtype != object else df[n]
+        if required:
+            raise ValueError(f"Catalyst CSV error: missing one of {names}")
+        return pd.Series(default, index=df.index, dtype="float64")
+
+    # Ticker
+    tick = None
+    for n in ["ticker","symbol","sym","asset"]:
+        if n in df.columns:
+            tick = df[n].astype(str).str.upper().str.strip()
+            break
+    if tick is None:
+        raise ValueError("Catalyst CSV error: missing 'ticker' column.")
+
+    out = pd.DataFrame({
+        "ticker": tick,
+        "t_bull": pick(df, ["t_bull","target_bull","bull_target","bull_price"]),
+        "t_base": pick(df, ["t_base","target_base","base_target","base_price"]),
+        "t_bear": pick(df, ["t_bear","target_bear","bear_target","bear_price"]),
+        "p_bull": pick(df, ["p_bull","prob_bull","bull_p","bull_prob"]),
+        "p_base": pick(df, ["p_base","prob_base","base_p","base_prob"]),
+        "p_bear": pick(df, ["p_bear","prob_bear","bear_p","bear_prob"]),
+    })
+    # Optional last price
+    if "last" in df.columns:
+        out["last"] = _num_series(df["last"])
+    elif "price" in df.columns:
+        out["last"] = _num_series(df["price"])
+    else:
+        out["last"] = np.nan
+
+    # Drop incomplete rows (must have targets and probabilities)
+    must_have = ["t_bull","t_base","t_bear","p_bull","p_base","p_bear"]
+    out = out.dropna(subset=must_have, how="any")
+    return out
+
+# -------------------------
+# EV Engine
+# -------------------------
+def normalize_probs(row, pcols=("p_bull","p_base","p_bear")):
+    p = pd.to_numeric(row[list(pcols)], errors="coerce")
+    s = p.sum()
+    warn = False
+    if not np.isfinite(s) or s <= 0:
+        # fallback to priors
+        p = pd.Series([0.35, 0.45, 0.20], index=pcols)
+        s = 1.0
+        warn = True
+    elif abs(s - 1.0) > 1e-6:
+        p = p / s
+        warn = True
+    row[list(pcols)] = p.values
+    return row, warn
+
+def compute_ev_table(positions_df, cards_df, price_source="positions",
+                     assumed_price=None, L=1.0, r_annual=0.08, hold_days=5,
+                     macro_weight=1.0):
+    if positions_df is None or positions_df.empty:
+        return pd.DataFrame(), ["No positions loaded."]
+    if cards_df is None or cards_df.empty:
+        return pd.DataFrame(), ["No catalyst cards loaded."]
+
+    pos = positions_df.copy()
+    cards = cards_df.copy()
+    pos["ticker"] = pos["ticker"].astype(str).str.upper().str.strip()
+    cards["ticker"] = cards["ticker"].astype(str).str.upper().str.strip()
+
+    # numeric casting
+    for c in ["shares","avg","price"]:
+        if c in pos.columns:
+            pos[c] = _num_series(pos[c])
+    for c in ["last","t_bull","t_base","t_bear","p_bull","p_base","p_bear"]:
+        if c in cards.columns:
+            cards[c] = _num_series(cards[c])
+
+    df = pos.merge(cards, on="ticker", how="inner", suffixes=("_pos","_card"))
+    warns = []
+    if df.empty:
+        return df, ["No ticker overlap between positions and catalyst cards."]
+
+    # normalize probabilities per row
+    prob_warn_rows = []
+    rows = []
+    for _, r in df.iterrows():
+        r2 = r.copy()
+        r2, w = normalize_probs(r2, pcols=("p_bull","p_base","p_bear"))
+        if w:
+            prob_warn_rows.append(str(r2["ticker"]))
+        rows.append(r2)
+    df = pd.DataFrame(rows)
+    if prob_warn_rows:
+        warns.append("Probabilities renormalized for: " + ", ".join(sorted(set(prob_warn_rows))))
+
+    # choose price
+    if price_source == "positions":
+        use_price = df["price"]
+        use_price = use_price.where(use_price.notna(), df.get("avg", np.nan))
+    elif price_source == "cards_last":
+        use_price = df.get("last", np.nan)
+    else:  # assumed
+        if assumed_price is None or not np.isfinite(assumed_price):
+            return pd.DataFrame(), ["Assumed price not provided / invalid."]
+        use_price = pd.Series(float(assumed_price), index=df.index, dtype=float)
+
+    df["use_price"] = _num_series(use_price)
+    miss = df["use_price"].isna()
+    if miss.any():
+        missing_tk = sorted(df.loc[miss, "ticker"].unique())
+        warns.append(f"Missing price for: {missing_tk}")
+        df = df.loc[~miss].copy()
+    if df.empty:
+        return df, warns if warns else ["No rows with usable price."]
+
+    # EV target per share (weighted targets)
+    df["EV_target"] = (
+        df["p_bull"] * df["t_bull"] +
+        df["p_base"] * df["t_base"] +
+        df["p_bear"] * df["t_bear"]
+    ) * float(macro_weight)
+
+    # EV €/share and %
+    df["EV_abs_sh"] = df["EV_target"] - df["use_price"]
+    df["EV_pct"] = (df["EV_abs_sh"] / df["use_price"]) * 100.0
+
+    # Position EV (unlevered)
+    df["PosEV_unlev_€"] = df["EV_abs_sh"] * df["shares"]
+
+    # Leverage & funding drag (LCM/DMCR)
+    L = max(1.0, float(L))
+    c = float(r_annual) * (float(hold_days)/365.0) * max(0.0, L - 1.0)
+    df["funding_drag_sh"] = c * df["use_price"]
+    df["EV_abs_sh_lev"] = df["EV_abs_sh"] * L - df["funding_drag_sh"]
+    df["EV_pct_lev"] = (df["EV_abs_sh_lev"] / df["use_price"]) * 100.0
+    df["PosEV_lev_€"] = df["EV_abs_sh_lev"] * df["shares"]
+
+    # Outcome return %
+    df["Bull_ret_%"] = ((df["t_bull"] - df["use_price"]) / df["use_price"]) * 100.0
+    df["Base_ret_%"] = ((df["t_base"] - df["use_price"]) / df["use_price"]) * 100.0
+    df["Bear_ret_%"] = ((df["t_bear"] - df["use_price"]) / df["use_price"]) * 100.0
+
+    cols = [
+        "ticker","shares","use_price",
+        "t_bull","t_base","t_bear","p_bull","p_base","p_bear",
+        "EV_target","EV_abs_sh","EV_pct","PosEV_unlev_€",
+        "EV_abs_sh_lev","EV_pct_lev","PosEV_lev_€",
+        "Bull_ret_%","Base_ret_%","Bear_ret_%","funding_drag_sh"
+    ]
+    out = df[[c for c in cols if c in df.columns]].sort_values("EV_pct", ascending=False).reset_index(drop=True)
+    return out, warns
+
+# -------------------------
+# Session init
+# -------------------------
 if "positions" not in st.session_state:
     st.session_state.positions = pd.DataFrame(columns=["ticker","shares","avg","price"])
 if "cards" not in st.session_state:
-    st.session_state.cards = pd.DataFrame(columns=[
-        "ticker","type","date","t_bull","t_base","t_bear","p_bull","p_base","p_bear","news","flow","conf"
-    ])
-if "cash" not in st.session_state: st.session_state.cash = 0.0
-if "ev_last" not in st.session_state: st.session_state.ev_last = {}
+    st.session_state.cards = pd.DataFrame()
 
-# --- Helpers ---
-def clamp(x, lo, hi):
-    try: x = float(x)
-    except: x = 0.0
-    return max(lo, min(hi, x))
+# -------------------------
+# UI — Sidebar
+# -------------------------
+with st.sidebar:
+    st.header("Data Upload")
+    st.write("Upload your Positions CSV (from broker) and Catalyst Cards CSV.")
 
-def prob_triplet(p_bull, p_bear):
-    p_bull = clamp(p_bull, 0.0, 0.99)
-    p_bear = clamp(p_bear, 0.0, 0.99)
-    p_base = 1.0 - (p_bull + p_bear)
-    if p_base < 0:
-        total = max(p_bull + p_bear, 1e-12)
-        p_bull /= total; p_bear /= total; p_base = 0.0
-    s = p_bull + p_base + p_bear
-    if s <= 0: return (0.0, 1.0, 0.0)
-    p_bull, p_base, p_bear = (p_bull/s, p_base/s, p_bear/s)
-    return (round(p_bull,4), round(p_base,4), round(p_bear,4))
-
-def dte_from_str(s):
-    if not isinstance(s, str): return np.nan
-    s = s.strip().replace(".", "/").replace("-", "/")
-    for fmt in ("%Y/%m/%d","%Y/%m/%d %H:%M","%Y/%m/%d %H:%M:%S"):
-        try: return (datetime.strptime(s, fmt).date() - date.today()).days
-        except: pass
-    return np.nan
-
-def calc_odds(p_bull, p_base, p_bear):
-    up, dn = p_bull, p_bear
-    return 0.0 if (up+dn)<=0 else round(up/(up+dn),4)
-
-def w_conf(conf, news, flow):
-    return round(0.5*clamp(conf,0,1) + 0.3*clamp(news,0,1) + 0.2*clamp(flow,0,1), 4)
-
-def expected_return_pct(price, t_bull, t_base, t_bear, p_bull, p_base, p_bear, confw):
-    price = float(price or 0.0)
-    if price <= 0: return 0.0
-    r_bull = (t_bull - price)/price
-    r_base = (t_base - price)/price
-    r_bear = (t_bear - price)/price
-    ev = p_bull*r_bull + p_base*r_base + p_bear*r_bear
-    ev *= (0.6 + 0.4*confw)
-    return round(float(ev),4)
-
-def current_price_for(ticker):
-    df = st.session_state.positions
-    if df.empty: return np.nan
-    row = df[df["ticker"]==ticker]
-    if row.empty: return np.nan
-    return float(row.iloc[0]["price"]) if pd.notna(row.iloc[0]["price"]) else np.nan
-
-def momentum_tag(key, ev_now):
-    prev = st.session_state.ev_last.get(key)
-    st.session_state.ev_last[key] = ev_now
-    if prev is None: return "—", 0.0
-    delta = ev_now - prev
-    if delta > 0.01: return "Up", round(delta,4)
-    if delta < -0.01: return "Down", round(delta,4)
-    return "Flat", round(delta,4)
-
-# --- NEW: IBKR / Generic PortfolioAnalyst parser ---
-def parse_portfolio_analyst(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Maps common IBKR PortfolioAnalyst / generic exports to positions schema:
-    Output columns: ticker, shares, avg, price
-    Tries multiple possible column names.
-    """
-    cols = {c.lower(): c for c in df_raw.columns}
-    def pick(*opts):
-        for o in opts:
-            if o in cols: return cols[o]
-        return None
-
-    c_ticker = pick("symbol","ticker","conid","underlying symbol")
-    c_shares = pick("quantity","position","shares","qty")
-    c_avg    = pick("cost basis","average cost","avg cost","avg_cost","avg")
-    c_price  = pick("mark price","price","last price","market price","mark")
-
-    if c_ticker is None or c_shares is None:
-        raise ValueError("Required columns not found (need Symbol/Ticker and Quantity/Position).")
-
-    out = pd.DataFrame()
-    out["ticker"] = (df_raw[c_ticker].astype(str)
-                     .str.upper().str.extract(r"([A-Z\.\-]+)")[0].fillna("").str.strip())
-    out["shares"] = pd.to_numeric(df_raw[c_shares], errors="coerce").fillna(0).astype(int)
-    out["avg"]    = pd.to_numeric(df_raw[c_avg],    errors="coerce").fillna(0.0) if c_avg else 0.0
-    out["price"]  = pd.to_numeric(df_raw[c_price],  errors="coerce").fillna(np.nan) if c_price else np.nan
-
-    # Filter valid rows
-    out = out[(out["ticker"]!="") & (out["shares"]>=0)].copy()
-    # Aggregate duplicates by ticker
-    agg = out.groupby("ticker", as_index=False).agg({
-        "shares":"sum",
-        "avg":"mean",
-        "price":"mean"
-    })
-    # Ensure float types
-    for c in ["avg","price"]:
-        agg[c] = pd.to_numeric(agg[c], errors="coerce")
-    return agg.reset_index(drop=True)
-
-# --- Watchlist builder ---
-def build_ranked_watchlist(cards: pd.DataFrame) -> pd.DataFrame:
-    if cards.empty:
-        return pd.DataFrame(columns=[
-            "ticker","type","date","dte","price","t_bull","t_base","t_bear",
-            "p_bull","p_base","p_bear","ev_pct","odds","momentum","Δev"
-        ])
-    rows=[]
-    for _, r in cards.iterrows():
-        tkr = str(r["ticker"]).upper().strip()
-        ctyp = str(r["type"]).strip()
-        raw_date = str(r["date"])
-        dte = dte_from_str(raw_date)
-
-        tb = float(pd.to_numeric(r["t_bull"], errors="coerce") or 0.0)
-        ts = float(pd.to_numeric(r["t_base"], errors="coerce") or 0.0)
-        td = float(pd.to_numeric(r["t_bear"], errors="coerce") or 0.0)
-        pb = float(pd.to_numeric(r["p_bull"], errors="coerce") or 0.0)
-        ps = float(pd.to_numeric(r["p_base"], errors="coerce") or 0.0)
-        pn = float(pd.to_numeric(r["p_bear"], errors="coerce") or 0.0)
-        news = float(pd.to_numeric(r.get("news",0.0), errors="coerce") or 0.0)
-        flow = float(pd.to_numeric(r.get("flow",0.0), errors="coerce") or 0.0)
-        conf = float(pd.to_numeric(r.get("conf",0.0), errors="coerce") or 0.0)
-
-        price = current_price_for(tkr)
-        confw = w_conf(conf, news, flow)
-        ev = expected_return_pct(price, tb, ts, td, pb, ps, pn, confw)
-        odds = calc_odds(pb, ps, pn)
-        tag, delta = momentum_tag((tkr, ctyp), ev)
-
+    pos_file = st.file_uploader("Positions CSV", type=["csv"], key="pos_up")
+    if pos_file is not None:
         try:
-            date_disp = pd.to_datetime(raw_date.replace("/", "-"), errors="coerce").date()
-        except: date_disp = None
-
-        rows.append({
-            "ticker": tkr, "type": ctyp, "date": date_disp, "dte": dte,
-            "price": price, "t_bull": tb, "t_base": ts, "t_bear": td,
-            "p_bull": pb, "p_base": ps, "p_bear": pn,
-            "ev_pct": ev, "odds": odds, "momentum": tag, "Δev": delta
-        })
-    df = pd.DataFrame(rows)
-    df = df.sort_values(by=["ev_pct","dte","odds"], ascending=[False, True, False],
-                        na_position="last").reset_index(drop=True)
-    return df
-
-# --- Layout ---
-left, right = st.columns([0.28, 0.72])
-
-with left:
-    st.markdown("## 🧾 Portfolio")
-    cash_val = st.number_input("Cash (€)", min_value=0.0, value=float(st.session_state.cash), step=50.0)
-    if st.button("Save Cash", use_container_width=True):
-        st.session_state.cash = float(cash_val); st.success("Cash saved")
-
-    st.markdown("---")
-    st.markdown("### ➕ Add / Update Position")
-    tkr_in = st.text_input("Ticker", value="")
-    avg_in = st.number_input("Avg Cost", min_value=0.0, value=0.0, step=0.01)
-    shr_in = st.number_input("Shares", min_value=0, value=0, step=1)
-    prc_in = st.number_input("Current Price", min_value=0.0, value=0.0, step=0.01)
-
-    def upsert_position():
-        if not tkr_in.strip():
-            st.warning("Enter a ticker."); return
-        t = tkr_in.upper().strip()
-        row = pd.DataFrame([{"ticker":t,"shares":int(shr_in),"avg":float(avg_in),"price":float(prc_in)}])
-        df = st.session_state.positions.copy()
-        df = df[df["ticker"] != t]
-        st.session_state.positions = pd.concat([df, row], ignore_index=True)
-        st.success(f"Position saved for {t}")
-    st.button("Add/Update Position", on_click=upsert_position, use_container_width=True)
-
-    st.markdown("#### Upload Positions CSV (simple)")
-    pos_csv = st.file_uploader("Columns: ticker, shares, avg, price", type=["csv"], key="pos_csv_simple")
-    if pos_csv is not None:
+            dfp_raw = pd.read_csv(pos_file)
+        except Exception:
+            pos_file.seek(0)
+            dfp_raw = pd.read_csv(io.StringIO(pos_file.getvalue().decode("utf-8", errors="ignore")))
         try:
-            df = pd.read_csv(pos_csv)
-            df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-            df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0).astype(int)
-            for c in ["avg","price"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-            df = df[(df["ticker"]!="") & (df["shares"]>=0)]
-            st.session_state.positions = df.reset_index(drop=True)
-            st.success("Positions CSV loaded.")
+            st.session_state.positions = _map_positions_columns(dfp_raw)
+            st.success(f"Loaded {len(st.session_state.positions)} positions.")
         except Exception as e:
-            st.error(f"Positions CSV error: {e}")
+            st.error(str(e))
 
-    st.download_button(
-        "Download current Positions CSV",
-        data=st.session_state.positions.to_csv(index=False).encode("utf-8"),
-        file_name="positions_current.csv",
-        mime="text/csv",
-        use_container_width=True
+    cards_file = st.file_uploader("Catalyst Cards CSV", type=["csv"], key="cards_up")
+    if cards_file is not None:
+        try:
+            dfc_raw = pd.read_csv(cards_file)
+        except Exception:
+            cards_file.seek(0)
+            dfc_raw = pd.read_csv(io.StringIO(cards_file.getvalue().decode("utf-8", errors="ignore")))
+        try:
+            st.session_state.cards = _map_cards_columns(dfc_raw)
+            st.success(f"Loaded {len(st.session_state.cards)} catalyst rows.")
+        except Exception as e:
+            st.error(str(e))
+
+    st.write("---")
+    st.caption("Tip: CSV headers are flexible. Minimum required:\n"
+               "- Positions: ticker, shares (avg/price optional)\n"
+               "- Cards: ticker, t_bull/base/bear, p_bull/base/bear (last optional)")
+
+# -------------------------
+# UI — Main
+# -------------------------
+st.title("Catalyst EV Calculator")
+
+colL, colR = st.columns([2, 1])
+with colL:
+    st.subheader("Positions (parsed)")
+    if st.session_state.positions.empty:
+        st.info("No positions loaded yet.")
+    else:
+        st.dataframe(st.session_state.positions, use_container_width=True, height=240)
+
+    st.subheader("Catalyst Cards (parsed)")
+    if st.session_state.cards.empty:
+        st.info("No catalyst cards loaded yet.")
+    else:
+        st.dataframe(st.session_state.cards, use_container_width=True, height=280)
+
+with colR:
+    st.subheader("EV Settings")
+    price_source = st.selectbox("Price source", ["positions","cards_last","assumed"])
+    assumed = None
+    if price_source == "assumed":
+        assumed = st.number_input("Assumed price (applies to all)", min_value=0.0, value=1.0, step=0.01)
+    macro_weight = st.slider("Macro weight (AdjEV multiplier)", 0.7, 1.6, 1.0, 0.05)
+    L = st.number_input("Leverage L (≥1.0)", min_value=1.0, value=1.0, step=0.1)
+    r_annual = st.number_input("Annual rate for funding rₐ", min_value=0.0, value=0.08, step=0.01, format="%.2f")
+    hold_days = st.number_input("Expected hold days", min_value=1, value=5, step=1)
+
+    run = st.button("Run EV math", type="primary", use_container_width=True)
+
+st.write("---")
+st.subheader("EV Results")
+
+if run:
+    ev_table, ev_warns = compute_ev_table(
+        st.session_state.positions,
+        st.session_state.cards,
+        price_source=price_source,
+        assumed_price=assumed,
+        L=L, r_annual=r_annual, hold_days=hold_days,
+        macro_weight=macro_weight
     )
+    if ev_warns:
+        for w in ev_warns:
+            st.warning(w)
 
-with right:
-    st.markdown("## 🤖 Catalyst Copilot — v0.4.2")
+    if ev_table.empty:
+        st.info("No EV rows to display. Check that tickers overlap between Positions and Cards.")
+    else:
+        st.dataframe(ev_table, use_container_width=True, height=420)
 
-    # --- NEW: IBKR / PortfolioAnalyst Import (ALWAYS VISIBLE) ---
-    st.markdown("### 📥 Import — Portfolio Analyst (IBKR/Generic)")
-    ibkr_file = st.file_uploader("Upload IBKR PortfolioAnalyst or generic broker CSV", type=["csv"], key="ibkr_pa")
-    if ibkr_file is not None:
-        try:
-            raw = pd.read_csv(ibkr_file)
-            parsed = parse_portfolio_analyst(raw)
-            if parsed.empty:
-                st.warning("No valid rows found after parsing.")
-            else:
-                # Merge into positions (ticker-level overwrite)
-                base = st.session_state.positions.copy()
-                base = base[~base["ticker"].isin(parsed["ticker"])]
-                st.session_state.positions = pd.concat([base, parsed], ignore_index=True)
-                st.success(f"Imported {len(parsed)} tickers from PortfolioAnalyst CSV.")
-                st.dataframe(parsed, use_container_width=True)
-        except Exception as e:
-            st.error(f"PortfolioAnalyst import error: {e}")
+        # Portfolio totals
+        tot_unlev = float(ev_table["PosEV_unlev_€"].sum()) if "PosEV_unlev_€" in ev_table else 0.0
+        tot_lev = float(ev_table["PosEV_lev_€"].sum()) if "PosEV_lev_€" in ev_table else 0.0
+        m1, m2 = st.columns(2)
+        m1.metric("Portfolio PosEV (unlevered) €", f"{tot_unlev:,.2f}")
+        m2.metric("Portfolio PosEV (levered) €", f"{tot_lev:,.2f}")
 
-    with st.expander("Catalyst Cards — add & rank", expanded=True):
-        c1, c2, c3, c4 = st.columns([1.1, 1, 1, 1])
-        typ = c1.selectbox("Type", ["PDUFA","Readout","CHMP","Earnings","Policy","Conf"], index=0)
-        t_bull = c2.number_input("Target Bull*", value=0.0, step=0.10, format="%.2f")
-        t_base = c3.number_input("Target Base*", value=0.0, step=0.10, format="%.2f")
-        t_bear = c4.number_input("Target Bear*", value=0.0, step=0.10, format="%.2f")
-
-        d1, d2, d3, d4 = st.columns([1, 1, 1, 1])
-        p_bear_in = d1.number_input("p_bear*", value=0.20, min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
-        news = d2.number_input("News score (0–1)", value=0.0, min_value=0.0, max_value=1.0, step=0.05)
-        flow = d3.number_input("Flow score (0–1)", value=0.0, min_value=0.0, max_value=1.0, step=0.05)
-        conf = d4.slider("Confidence (0–1)", 0.0, 1.0, 0.60)
-
-        e1, e2 = st.columns([1.2, 2])
-        ticker_card = e1.text_input("Ticker*", value="", placeholder="e.g., ALT").upper().strip()
-        event_date = e2.text_input("Event Date*", value=date.today().strftime("%Y/%m/%d"))
-
-        p_bull_in = clamp(1.0 - p_bear_in, 0.0, 1.0) * 0.6
-        p_bull, p_base, p_bear = prob_triplet(p_bull_in, p_bear_in)
-
-        if st.button("Add Card", use_container_width=True):
-            if not ticker_card: st.warning("Ticker required for card.")
-            else:
-                row = {
-                    "ticker": ticker_card, "type": typ, "date": event_date,
-                    "t_bull": t_bull, "t_base": t_base, "t_bear": t_bear,
-                    "p_bull": p_bull, "p_base": p_base, "p_bear": p_bear,
-                    "news": news, "flow": flow, "conf": conf
-                }
-                st.session_state.cards = pd.concat([st.session_state.cards, pd.DataFrame([row])], ignore_index=True)
-                st.success(f"Card added: {ticker_card} / {typ}")
-
-        st.markdown("#### Upload Catalyst Cards CSV")
-        cards_csv = st.file_uploader(
-            "Columns: ticker,type,date,t_bull,t_base,t_bear,p_bull,p_base,p_bear,news,flow,conf",
-            type=["csv"], key="cards_csv")
-        if cards_csv is not None:
-            try:
-                df = pd.read_csv(cards_csv)
-                need = {"ticker","type","date","t_bull","t_base","t_bear","p_bull","p_base","p_bear"}
-                if not need.issubset(df.columns):
-                    miss = sorted(list(need - set(df.columns)))
-                    raise ValueError(f"Missing columns: {miss}")
-                df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-                st.session_state.cards = df.reset_index(drop=True)
-                st.success("Catalyst cards CSV loaded.")
-            except Exception as e:
-                st.error(f"Cards CSV error: {e}")
-
+        # Download EV table
+        csv_buf = ev_table.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download current Catalyst Cards CSV",
-            data=st.session_state.cards.to_csv(index=False).encode("utf-8"),
-            file_name="catalyst_cards_current.csv",
+            "Download EV Table (CSV)",
+            data=csv_buf,
+            file_name="ev_results.csv",
             mime="text/csv",
             use_container_width=True
         )
-
-    st.markdown("### 🧮 Catalyst Watchlist (ranked)")
-    watch = build_ranked_watchlist(st.session_state.cards)
-    st.dataframe(watch, use_container_width=True)
-
-    st.markdown("### 📈 Portfolio — EV & Reinvest Plan")
-    pos = st.session_state.positions.copy()
-    if pos.empty:
-        st.info("No positions yet. Add a position on the left or import a CSV.")
-    else:
-        pos["MktVal€"] = pos["shares"] * pos["price"]
-        pos["EV_%"] = 0.0
-        if not watch.empty:
-            ev_map = watch.groupby("ticker")["ev_pct"].max().to_dict()
-            pos["EV_%"] = pos["ticker"].map(ev_map).fillna(0.0)
-        pos["EV_€"] = pos["MktVal€"] * pos["EV_%"]
-        mv = round(float(pos["MktVal€"].sum()), 2)
-        sum_ev = round(float(pos["EV_€"].sum()), 2)
-        c1, c2, c3 = st.columns([2.6, 1, 1])
-        with c1: st.dataframe(pos[["ticker","shares","avg","price","MktVal€","EV_%","EV_€"]], use_container_width=True)
-        with c2: st.metric("Market Value (€)", f"{mv:,.2f}"); st.metric("Sum EV (€)", f"{sum_ev:,.2f}")
-        with c3: st.metric("Cash (€)", f"{st.session_state.cash:,.2f}")
-
-        st.markdown("#### 🔁 Reinvest Planner")
-        r = st.slider("Reinvest rate r (0–100%)", 0, 100, 60)
-        budget = round(st.session_state.cash * (r/100.0), 2)
-        st.caption(f"Budget: €{budget:,.2f}")
-        cand = watch[(watch["ev_pct"]>0)].copy()
-        cand = cand[pd.to_numeric(cand["price"], errors="coerce")>0]
-        cand["score"] = cand["odds"] * cand["ev_pct"].clip(lower=0)
-        if cand.empty or cand["score"].sum()<=0 or budget<=0:
-            alloc_df = pd.DataFrame(columns=["ticker","price","ev_pct","odds","alloc€","buy_shares"])
-            st.info("No positive-EV candidates with valid prices, or budget = 0.")
-        else:
-            cand["w"] = cand["score"]/cand["score"].sum()
-            cand["alloc€"] = cand["w"]*budget
-            cand["buy_shares"] = np.floor(cand["alloc€"]/cand["price"]).astype(int)
-            alloc_df = cand[["ticker","price","ev_pct","odds","alloc€","buy_shares"]].reset_index(drop=True)
-        st.dataframe(alloc_df, use_container_width=True)
-        st.caption("Sizing ∝ (odds × EV%) under cash budget. (PRB risk caps coming next).")
-
-# --- Math Audit ---
-st.markdown("---")
-st.caption("🔎 Math Audit")
-alerts = []
-if not st.session_state.cards.empty:
-    cards = st.session_state.cards
-    # Check probabilities
-    sdiff = np.abs((cards[["p_bull","p_base","p_bear"]].sum(axis=1) - 1.0)) > 1e-6
-    if sdiff.any(): alerts.append(f"{int(sdiff.sum())} card(s) with probabilities not summing to 1.000.")
-if not st.session_state.positions.empty and st.session_state.positions["price"].le(0).any():
-    alerts.append("Some position prices ≤ 0 (update from left panel or CSV import).")
-if alerts:
-    for a in alerts: st.error(a)
 else:
-    st.success("All core math checks passed.")
-st.caption("v0.4.2 — adds IBKR PortfolioAnalyst importer + robust column mapping.")
+    st.info("Load both CSVs, choose settings, then click **Run EV math**.")
+
+# Footer
+st.caption("EV = Σ(p_i × target_i) − price; levered EV adjusts for funding drag. "
+           "Ensure probabilities sum to 1.0 for each ticker.")
