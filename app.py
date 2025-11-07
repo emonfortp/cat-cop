@@ -1,351 +1,483 @@
+# app.py
+# Cat-Cop: Catalyst Portfolio Optimizer (Streamlit)
+# - Robust CSV ingestion (positions + catalysts)
+# - Cached quotes
+# - EV math from bull/base/bear
+# - Alerts / Short-Fuse panel (DTE ≤ 15 & EV% threshold)
+# - Greedy allocator with numeric-safety fixes
+# - Fully self-contained (no fancy env vars required)
+
 import os
 import io
-import math
-from datetime import datetime, timezone
-from dateutil import parser as dtparser
+from datetime import datetime, date, timedelta, timezone
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# -----------------------------
-# APP CONFIG
-# -----------------------------
-st.set_page_config(page_title="Cat-Cop: Catalyst Copilot", layout="wide")
-st.title("🧪 Cat-Cop — Catalyst Portfolio Copilot")
-
-# -----------------------------
-# UTILITIES
-# -----------------------------
-NUMERIC_KW = dict(errors="coerce", downcast="float")
-
-def _now_utc():
-    return datetime.now(timezone.utc)
-
-def _coerce_numeric(df, cols):
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], **NUMERIC_KW)
-    return df
-
-def _std_cols(df, mapping):
-    """
-    Rename columns according to a priority mapping list.
-    mapping: dict canonical_name -> list of possible names (lowercased match)
-    """
-    lower = {c.lower(): c for c in df.columns}
-    rename_map = {}
-    for canon, candidates in mapping.items():
-        for cand in candidates:
-            if cand in lower:
-                rename_map[lower[cand]] = canon
-                break
-    df = df.rename(columns=rename_map)
-    return df
-
-def _parse_date(s):
-    if pd.isna(s):
-        return pd.NaT
-    try:
-        return dtparser.parse(str(s)).astimezone(timezone.utc).date()
-    except Exception:
-        return pd.NaT
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_quotes_yf(tickers):
-    """Fetch last price via yfinance (cached). Returns dict {ticker: price}."""
+# Optional quotes; we guard imports & failures gracefully
+try:
     import yfinance as yf
-    prices = {}
-    if not tickers:
-        return prices
-    # yfinance prefers batched Tickers but single calls are most reliable
-    for t in tickers:
-        try:
-            y = yf.Ticker(t)
-            info = y.fast_info  # fast path
-            p = None
-            if info is not None:
-                p = info.get("last_price", None)
-                if p is None:
-                    p = info.get("last_close", None)
-            if p is None:
-                hist = y.history(period="5d", auto_adjust=False)
-                if not hist.empty:
-                    p = float(hist["Close"].iloc[-1])
-            if p is not None and np.isfinite(p) and p > 0:
-                prices[t] = float(p)
-        except Exception:
-            # Keep going; missing quotes should not kill the app
-            continue
-    return prices
+    YF_OK = True
+except Exception:
+    YF_OK = False
 
-# -----------------------------
-# INPUTS — SIDEBAR
-# -----------------------------
-st.sidebar.header("Inputs")
 
-st.sidebar.markdown("**1) Positions CSV (optional)**")
-pos_file = st.sidebar.file_uploader(
-    "Upload positions CSV (columns like: ticker/symbol, qty, avg, price)",
-    type=["csv"], key="pos_csv")
+# --------------------------- Streamlit Page ---------------------------
 
-st.sidebar.markdown("**2) Catalyst CSV (optional)**")
-cat_file = st.sidebar.file_uploader(
-    "Upload catalyst CSV (columns like: ticker, date, p_bull/p_base/p_bear, t_bull/t_base/t_bear, confidence)",
-    type=["csv"], key="cat_csv")
+st.set_page_config(page_title="Cat-Cop", page_icon="🧠", layout="wide")
+st.title("🧠 Catalyst Portfolio Optimizer")
 
-use_live_quotes = st.sidebar.toggle("Enable live quotes (yfinance, cached 5 min)", value=False)
-ev_threshold = st.sidebar.number_input("Short-Fuse EV% minimum", value=15.0, step=1.0)
-conf_threshold = st.sidebar.number_input("Short-Fuse Confidence minimum", value=0.70, step=0.05, min_value=0.0, max_value=1.0)
+st.caption(
+    "v4.6.1 • Positions + Catalyst EV • Cached Quotes • Alerts/Short-Fuse (≤15d) • "
+    "Greedy Allocator (numeric-safe) • This app never executes trades."
+)
 
-budget = st.sidebar.number_input("Budget for new ideas (€)", value=1000.0, step=50.0, min_value=0.0)
-max_positions = st.sidebar.number_input("Max suggestions", value=5, step=1, min_value=1)
 
-# -----------------------------
-# LOAD / STANDARDIZE POSITIONS
-# -----------------------------
-def load_positions():
-    if pos_file is None:
-        # Safe default empty structure
-        return pd.DataFrame(columns=["ticker", "qty", "avg", "price"])
+# --------------------------- Helpers ---------------------------
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _yf_price_one(ticker: str) -> Optional[float]:
+    """Fetch latest price via yfinance; return None on failure."""
+    if not YF_OK or not ticker:
+        return None
     try:
-        df = pd.read_csv(pos_file)
-    except Exception as e:
-        st.sidebar.error(f"Positions CSV error: {e}")
+        t = yf.Ticker(ticker)
+        px = t.fast_info.last_price if hasattr(t, "fast_info") else None
+        if px is None or not np.isfinite(px) or px <= 0:
+            hist = t.history(period="1d")
+            if hist is not None and len(hist) > 0:
+                px = float(hist["Close"].iloc[-1])
+        if px is None or not np.isfinite(px) or px <= 0:
+            return None
+        return float(px)
+    except Exception:
+        return None
+
+
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
+
+
+def _to_num(series, default=None):
+    out = pd.to_numeric(series, errors="coerce")
+    if default is not None:
+        out = out.fillna(default)
+    return out
+
+
+# --------------------------- Positions Ingest ---------------------------
+
+def _std_positions_df(raw: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Standardize positions CSV to:
+      ['ticker','qty','avg','price'] where price falls back to avg if missing/invalid.
+    Accepts a wide range of broker exports:
+      - columns we try: ticker/symbol, quantity/qty/shares, avg/avgcost/cost, price/last/close
+    """
+    if raw is None or raw.empty:
         return pd.DataFrame(columns=["ticker", "qty", "avg", "price"])
 
-    df = _std_cols(df, {
-        "ticker": ["ticker", "symbol", "sym"],
-        "qty":    ["qty", "quantity", "shares", "units"],
-        "avg":    ["avg", "avgcost", "average_cost", "avg_cost", "cost_basis"],
-        "price":  ["price", "last", "mark"]
+    df = _norm_cols(raw)
+
+    # Map likely headers
+    col_map = {}
+    # ticker
+    for c in ["ticker", "symbol", "underlying", "security"]:
+        if c in df.columns:
+            col_map["ticker"] = c
+            break
+    # qty
+    for c in ["qty", "quantity", "shares", "position"]:
+        if c in df.columns:
+            col_map["qty"] = c
+            break
+    # avg cost
+    for c in ["avg", "avgcost", "averagecost", "cost_basis", "cost"]:
+        if c in df.columns:
+            col_map["avg"] = c
+            break
+    # price
+    for c in ["price", "last", "close", "mark"]:
+        if c in df.columns:
+            col_map["price"] = c
+            break
+
+    # Create missing columns
+    for need in ["ticker", "qty", "avg", "price"]:
+        if need not in col_map:
+            df[need] = np.nan
+
+    out = pd.DataFrame({
+        "ticker": df[col_map.get("ticker", "ticker")] if col_map.get("ticker") else df["ticker"],
+        "qty": _to_num(df[col_map.get("qty", "qty")] if col_map.get("qty") else df["qty"], default=0),
+        "avg": _to_num(df[col_map.get("avg", "avg")] if col_map.get("avg") else df["avg"]),
+        "price": _to_num(df[col_map.get("price", "price")] if col_map.get("price") else df["price"]),
     })
-    # Ensure canonical columns exist
-    for c in ["ticker", "qty", "avg", "price"]:
+
+    out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
+    # If price invalid → fall back to avg
+    out["price"] = np.where(~np.isfinite(out["price"]) | (out["price"] <= 0), out["avg"], out["price"])
+    # Prune empties
+    out = out[(out["ticker"] != "") & out["qty"].fillna(0).astype(float).gt(0)]
+    out.reset_index(drop=True, inplace=True)
+    return out
+
+
+# --------------------------- Catalyst / Watchlist Ingest ---------------------------
+
+def _std_watchlist_df(raw: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Standardize catalyst watchlist to the fields we need:
+      ['ticker','event_date','bull_target','base_target','bear_target','p_bull','p_base','p_bear','confidence']
+    If probs missing, default priors {0.35, 0.45, 0.20} and normalize to 1.
+    """
+    cols_needed = [
+        "ticker", "event_date",
+        "bull_target", "base_target", "bear_target",
+        "p_bull", "p_base", "p_bear",
+        "confidence"
+    ]
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=cols_needed)
+
+    df = _norm_cols(raw)
+
+    # Ensure columns exist
+    for c in cols_needed:
         if c not in df.columns:
             df[c] = np.nan
 
-    # Coerce numerics
-    df = _coerce_numeric(df, ["qty", "avg", "price"])
-
-    # Clean ticker
+    # Clean
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+    # Dates
+    df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce").dt.date
 
-    # Fill improper price with avg if needed
-    df["price"] = np.where(~np.isfinite(df["price"]) | (df["price"] <= 0), df["avg"], df["price"])
-    df["avg"]   = np.where(~np.isfinite(df["avg"]) | (df["avg"] <= 0), df["price"], df["avg"])
+    # Numerics
+    for c in ["bull_target", "base_target", "bear_target", "p_bull", "p_base", "p_bear", "confidence"]:
+        df[c] = _to_num(df[c])
 
-    # Drop empties
-    df = df[df["ticker"].str.len() > 0]
+    # Defaults for probabilities if missing
+    df["p_bull"] = df["p_bull"].fillna(0.35)
+    df["p_base"] = df["p_base"].fillna(0.45)
+    df["p_bear"] = df["p_bear"].fillna(0.20)
+    # Normalize to 1
+    s = df["p_bull"] + df["p_base"] + df["p_bear"]
+    s = s.replace(0, np.nan)
+    df["p_bull"] = df["p_bull"] / s
+    df["p_base"] = df["p_base"] / s
+    df["p_bear"] = df["p_bear"] / s
+
+    # Confidence default 0.60
+    df["confidence"] = df["confidence"].fillna(0.60)
+
+    # Drop rows without ticker or targets
+    must = ["bull_target", "base_target", "bear_target"]
+    ok_mask = (df["ticker"] != "")
+    for c in must:
+        ok_mask &= pd.notna(df[c])
+    df = df.loc[ok_mask].copy()
+
+    # DTE
+    today = date.today()
+    df["DTE"] = (pd.to_datetime(df["event_date"]) - pd.to_datetime(today)).dt.days
+
+    # Keep essentials
+    order = ["ticker", "event_date", "DTE",
+             "bull_target", "base_target", "bear_target",
+             "p_bull", "p_base", "p_bear", "confidence"]
+    df = df[order].reset_index(drop=True)
     return df
 
-positions = load_positions()
 
-# -----------------------------
-# LOAD / STANDARDIZE CATALYSTS
-# -----------------------------
-def load_catalysts():
-    if cat_file is None:
-        return pd.DataFrame(columns=[
-            "ticker","event","date","p_bull","p_base","p_bear","t_bull","t_base","t_bear","confidence"
-        ])
+# --------------------------- EV Math ---------------------------
+
+def _ensure_prices(df: pd.DataFrame, use_quotes: bool = True) -> pd.DataFrame:
+    """
+    Guarantee there is a 'price' column for EV calc:
+      - if 'price' exists and valid, keep it
+      - else fetch via yfinance (cached), or leave NaN if not available
+    """
+    df = df.copy()
+    if "price" not in df.columns:
+        df["price"] = np.nan
+
+    need_price = ~pd.notna(df["price"]) | (df["price"] <= 0)
+    if use_quotes:
+        for i in df[need_price].index:
+            tk = str(df.at[i, "ticker"]).upper().strip()
+            px = _yf_price_one(tk)
+            if px is not None:
+                df.at[i, "price"] = float(px)
+    return df
+
+
+def _calc_ev_table(pos_df: pd.DataFrame, wl_df: pd.DataFrame, use_quotes: bool = True) -> pd.DataFrame:
+    """
+    Join positions with watchlist by ticker (outer), fetch prices if needed, then compute:
+      EV_price = p_bull*Bull + p_base*Base + p_bear*Bear
+      EV_%     = (EV_price - price) / price * 100
+    Returns EV table per ticker.
+    """
+    # Unique tickers from either side
+    tickers = pd.unique(pd.concat([
+        pos_df["ticker"] if "ticker" in pos_df.columns else pd.Series(dtype=str),
+        wl_df["ticker"] if "ticker" in wl_df.columns else pd.Series(dtype=str)
+    ], ignore_index=True)).tolist()
+
+    # Build base frame
+    base = pd.DataFrame({"ticker": tickers})
+    # Attach any current price from positions (if there)
+    if "price" in pos_df.columns:
+        px_map = pos_df.dropna(subset=["ticker", "price"]).drop_duplicates("ticker").set_index("ticker")["price"]
+        base = base.join(px_map, on="ticker")
+    else:
+        base["price"] = np.nan
+
+    # Attach scenario & probs from watchlist
+    merge_cols = ["ticker", "event_date", "DTE",
+                  "bull_target", "base_target", "bear_target",
+                  "p_bull", "p_base", "p_bear", "confidence"]
+    base = base.merge(wl_df[merge_cols], on="ticker", how="left")
+
+    # Ensure prices
+    base = _ensure_prices(base, use_quotes=use_quotes)
+
+    # EV math (only where price valid)
+    base["EV_price"] = np.nan
+    valid_mask = pd.notna(base["price"]) & (base["price"] > 0)
+    base.loc[valid_mask, "EV_price"] = (
+        base.loc[valid_mask, "p_bull"] * base.loc[valid_mask, "bull_target"] +
+        base.loc[valid_mask, "p_base"] * base.loc[valid_mask, "base_target"] +
+        base.loc[valid_mask, "p_bear"] * base.loc[valid_mask, "bear_target"]
+    )
+    base["EV_pct"] = (base["EV_price"] - base["price"]) / base["price"] * 100.0
+    # Niceties
+    base["DTE"] = base["DTE"].fillna(999999).astype(int)
+    # Order
+    cols = ["ticker", "price", "EV_price", "EV_pct", "event_date", "DTE",
+            "bull_target", "base_target", "bear_target",
+            "p_bull", "p_base", "p_bear", "confidence"]
+    base = base[cols].sort_values(["DTE", "EV_pct"], ascending=[True, False]).reset_index(drop=True)
+    return base
+
+
+# --------------------------- EV Table Standardizer (allocator uses this) ---------------------------
+
+def _std_ev_df(ev_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize EV table for allocator:
+      - ticker, price, EV_pct
+      - coerce numerics safely
+    """
+    if ev_df is None or ev_df.empty:
+        return pd.DataFrame(columns=["ticker", "price", "EV_pct"])
+
+    df = ev_df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    for need in ["ticker", "price", "ev_pct"]:
+        if need not in df.columns:
+            df[need] = np.nan
+
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["ev_pct"] = pd.to_numeric(df["ev_pct"], errors="coerce")
+
+    df = df[["ticker", "price", "ev_pct"]]
+    return df
+
+
+# --------------------------- Allocator (numeric-safe) ---------------------------
+
+def suggest_alloc(ev_df: pd.DataFrame, budget_eur: float, max_n: int = 5) -> pd.DataFrame:
+    """
+    Greedy equal-euro allocator for the best EV_pct tickers.
+    Returns: ticker | price | EV_pct | suggest_shares | alloc_eur
+    """
+    if ev_df is None or ev_df.empty or budget_eur is None or budget_eur <= 0:
+        return pd.DataFrame(columns=["ticker", "price", "EV_pct", "suggest_shares", "alloc_eur"])
+
+    df = _std_ev_df(ev_df)
+
+    valid_mask = (
+        pd.notna(df["price"]) & (df["price"] > 0) &
+        pd.notna(df["ev_pct"])
+    )
+    df = df.loc[valid_mask].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["ticker", "price", "EV_pct", "suggest_shares", "alloc_eur"])
+
+    df.sort_values("ev_pct", ascending=False, inplace=True)
+    df = df.head(int(max_n)).copy()
+
+    n = len(df)
+    if n == 0:
+        return pd.DataFrame(columns=["ticker", "price", "EV_pct", "suggest_shares", "alloc_eur"])
+
+    per_name_eur = float(budget_eur) / n
+    df["suggest_shares"] = np.floor(per_name_eur / df["price"]).astype(int)
+    df["alloc_eur"] = df["suggest_shares"] * df["price"]
+    df = df[df["suggest_shares"] > 0].copy()
+
+    df.rename(columns={"ev_pct": "EV_pct"}, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+# --------------------------- Sidebar: Inputs ---------------------------
+
+st.sidebar.header("⚙️ Inputs")
+
+with st.sidebar.expander("💼 Upload Positions CSV", expanded=True):
+    st.write("Expected fields (flexible): **ticker/symbol**, **qty/quantity**, **avg/avgcost**, optional **price**.")
+    f_pos = st.file_uploader("Positions CSV", type=["csv"], key="pos_up")
+    if f_pos is not None:
+        try:
+            pos_raw = pd.read_csv(f_pos)
+            st.session_state.positions = _std_positions_df(pos_raw)
+            st.success(f"Loaded {len(st.session_state.positions)} positions.")
+        except Exception as e:
+            st.error(f"Positions CSV error: {e}")
+
+with st.sidebar.expander("🗓️ Upload Catalyst Watchlist CSV", expanded=True):
+    st.write("Columns: **ticker,event_date,bull_target,base_target,bear_target,p_bull,p_base,p_bear,confidence**.")
+    f_wl = st.file_uploader("Catalyst Watchlist CSV", type=["csv"], key="wl_up")
+    if f_wl is not None:
+        try:
+            wl_raw = pd.read_csv(f_wl)
+            st.session_state.watchlist = _std_watchlist_df(wl_raw)
+            st.success(f"Loaded {len(st.session_state.watchlist)} catalyst rows.")
+        except Exception as e:
+            st.error(f"Watchlist CSV error: {e}")
+
+with st.sidebar.expander("💶 Budget & Filters", expanded=True):
+    budget = st.number_input("Available budget (EUR)", min_value=0.0, value=1000.0, step=100.0)
+    max_positions = st.number_input("Max names to allocate", min_value=1, value=5, step=1)
+    use_quotes = st.toggle("Fetch quotes (cache 15 min)", value=True)
+    ev_alert_threshold = st.slider("Alerts: EV% ≥", min_value=-50.0, max_value=300.0, value=20.0, step=5.0)
+    dte_limit = st.slider("Alerts: DTE ≤ days", min_value=1, max_value=60, value=15, step=1)
+
+# Initialize session
+if "positions" not in st.session_state:
+    st.session_state.positions = pd.DataFrame(columns=["ticker", "qty", "avg", "price"])
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = pd.DataFrame(columns=[
+        "ticker", "event_date", "DTE",
+        "bull_target", "base_target", "bear_target",
+        "p_bull", "p_base", "p_bear", "confidence"
+    ])
+
+
+# --------------------------- Main Panels ---------------------------
+
+left, right = st.columns([1.2, 1])
+
+with left:
+    st.subheader("📊 Positions (standardized)")
+    st.dataframe(st.session_state.positions, use_container_width=True)
+
+    st.subheader("🧭 Catalyst Watchlist (standardized)")
+    st.dataframe(st.session_state.watchlist, use_container_width=True)
+
+    st.subheader("🧮 EV Table")
     try:
-        df = pd.read_csv(cat_file)
+        ev_table = _calc_ev_table(
+            st.session_state.positions.copy(),
+            st.session_state.watchlist.copy(),
+            use_quotes=use_quotes
+        )
+        st.dataframe(ev_table, use_container_width=True)
+        st.caption(f"EV dtypes: {dict(ev_table.dtypes)}")
     except Exception as e:
-        st.sidebar.error(f"Catalyst CSV error: {e}")
-        return pd.DataFrame(columns=[
-            "ticker","event","date","p_bull","p_base","p_bear","t_bull","t_base","t_bear","confidence"
-        ])
+        st.error(f"EV calc error: {e}")
+        ev_table = pd.DataFrame(columns=["ticker", "price", "EV_price", "EV_pct", "event_date", "DTE"])
 
-    df = _std_cols(df, {
-        "ticker":     ["ticker", "symbol", "sym"],
-        "event":      ["event", "catalyst", "name"],
-        "date":       ["date", "event_date", "when"],
-        "p_bull":     ["p_bull", "prob_bull", "bull_prob"],
-        "p_base":     ["p_base", "prob_base", "base_prob"],
-        "p_bear":     ["p_bear", "prob_bear", "bear_prob"],
-        "t_bull":     ["t_bull", "target_bull", "bull_target"],
-        "t_base":     ["t_base", "target_base", "base_target"],
-        "t_bear":     ["t_bear", "target_bear", "bear_target"],
-        "confidence": ["confidence", "conf", "cl"]
-    })
+with right:
+    st.subheader("⏰ Alerts / Short-Fuse (DTE ≤ threshold)")
+    try:
+        alerts = ev_table.copy()
+        alerts = alerts[
+            pd.notna(alerts["EV_pct"]) &
+            pd.notna(alerts["DTE"]) &
+            (alerts["DTE"] <= int(dte_limit)) &
+            (alerts["EV_pct"] >= float(ev_alert_threshold))
+        ].sort_values(["DTE", "EV_pct"], ascending=[True, False])
+        if alerts.empty:
+            st.info("No alert meets current thresholds.")
+        else:
+            st.dataframe(alerts[["ticker","event_date","DTE","price","EV_price","EV_pct","confidence"]],
+                         use_container_width=True)
+    except Exception as e:
+        st.error(f"Alerts error: {e}")
 
-    # Missing columns → create
-    for c in ["event","confidence"]:
-        if c not in df.columns: df[c] = np.nan
+    st.subheader("🧩 Suggested Allocation")
+    try:
+        # Normalize EV table before allocation (prevents dtype issues)
+        ev_table_std = _std_ev_df(ev_table)
+        alloc = suggest_alloc(ev_table_std, budget, int(max_positions))
+        if alloc.empty:
+            st.info("No allocation suggestion (check EV% & prices).")
+        else:
+            st.dataframe(alloc, use_container_width=True)
+            tot_alloc = float(alloc["alloc_eur"].sum())
+            st.metric("Allocated (EUR)", f"{tot_alloc:,.2f}")
+    except Exception as e:
+        st.error(f"Allocator error: {e}")
 
-    # Types
-    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-    for c in ["p_bull","p_base","p_bear","t_bull","t_base","t_bear","confidence"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], **NUMERIC_KW)
 
-    # Date & DTE
-    df["date"] = df["date"].apply(_parse_date)
-    today = _now_utc().date()
-    df["DTE"] = (pd.to_datetime(df["date"]) - pd.to_datetime(today)).dt.days
+# --------------------------- Sample CSV Downloaders ---------------------------
 
-    # Keep only meaningful rows
-    df = df[df["ticker"].str.len() > 0]
-    return df
+st.divider()
+st.subheader("📥 Sample CSV Templates")
 
-catalysts = load_catalysts()
+sample_pos = pd.DataFrame({
+    "ticker": ["KURA", "ALT", "IOVA"],
+    "qty": [50, 65, 30],
+    "avg": [12.10, 4.30, 42.00],
+    "price": [np.nan, np.nan, np.nan]
+})
 
-# -----------------------------
-# QUOTES MERGE
-# -----------------------------
-all_tickers = sorted(set(positions["ticker"].dropna().tolist() + catalysts["ticker"].dropna().tolist()))
-quote_map = {}
-if use_live_quotes and all_tickers:
-    with st.spinner("Fetching quotes..."):
-        quote_map = fetch_quotes_yf(all_tickers)
+sample_wl = pd.DataFrame({
+    "ticker": ["ALT", "KURA", "IOVA"],
+    "event_date": [(date.today()+timedelta(days=7)).isoformat(),
+                   (date.today()+timedelta(days=2)).isoformat(),
+                   (date.today()+timedelta(days=14)).isoformat()],
+    "bull_target": [8.50, 15.00, 58.00],
+    "base_target": [6.00, 13.00, 48.00],
+    "bear_target": [3.80, 10.50, 38.00],
+    "p_bull": [0.30, 0.35, 0.30],
+    "p_base": [0.50, 0.50, 0.50],
+    "p_bear": [0.20, 0.15, 0.20],
+    "confidence": [0.65, 0.60, 0.60]
+})
 
-def _effective_price(row):
-    # If we have a live quote, use it; else price; else avg
-    t = str(row.get("ticker", "")).upper()
-    live = quote_map.get(t, np.nan)
-    if np.isfinite(live) and live > 0:
-        return float(live)
-    p = row.get("price", np.nan)
-    a = row.get("avg", np.nan)
-    if np.isfinite(p) and p > 0:
-        return float(p)
-    if np.isfinite(a) and a > 0:
-        return float(a)
-    return np.nan
-
-# -----------------------------
-# EV MATH
-# -----------------------------
-def compute_ev_table(positions_df, catalysts_df):
-    if catalysts_df.empty:
-        return pd.DataFrame(columns=[
-            "ticker","event","date","DTE","p_bull","p_base","p_bear",
-            "t_bull","t_base","t_bear","confidence","price","EV_sh","EV_pct"
-        ])
-    df = catalysts_df.copy()
-
-    # Attach price (from positions or quotes)
-    pos_simple = positions_df[["ticker","price","avg"]].drop_duplicates()
-    df = df.merge(pos_simple, on="ticker", how="left")
-    df["price"] = df.apply(_effective_price, axis=1)
-    df = _coerce_numeric(df, ["price","t_bull","t_base","t_bear","p_bull","p_base","p_bear","confidence"])
-
-    # Probability discipline & normalization (if user CSV doesn't sum to 1)
-    probs = df[["p_bull","p_base","p_bear"]].fillna(0.0).values
-    sums = probs.sum(axis=1)
-    # If any sum is 0, fall back to priors
-    priors = np.array([0.35, 0.45, 0.20])
-    need_prior = (sums <= 0) | ~np.isfinite(sums)
-    probs[need_prior, :] = priors
-    # Normalize
-    sums = probs.sum(axis=1, keepdims=True)
-    probs = probs / np.where(sums == 0, 1.0, sums)
-    df[["p_bull","p_base","p_bear"]] = probs
-
-    # EV/sh = sum(prob * target)
-    df["EV_sh"] = df["p_bull"]*df["t_bull"] + df["p_base"]*df["t_base"] + df["p_bear"]*df["t_bear"]
-
-    # EV% relative to current effective price
-    df["EV_pct"] = np.where(
-        np.isfinite(df["price"]) & (df["price"] > 0),
-        (df["EV_sh"] - df["price"]) / df["price"] * 100.0,
-        np.nan
+c1, c2 = st.columns(2)
+with c1:
+    st.download_button(
+        "⬇️ Download positions_template.csv",
+        data=sample_pos.to_csv(index=False).encode("utf-8"),
+        file_name="positions_template.csv",
+        mime="text/csv"
+    )
+with c2:
+    st.download_button(
+        "⬇️ Download catalyst_watchlist_template.csv",
+        data=sample_wl.to_csv(index=False).encode("utf-8"),
+        file_name="catalyst_watchlist_template.csv",
+        mime="text/csv"
     )
 
-    cols = ["ticker","event","date","DTE","p_bull","p_base","p_bear",
-            "t_bull","t_base","t_bear","confidence","price","EV_sh","EV_pct"]
-    return df[cols].sort_values(["DTE","EV_pct"], ascending=[True, False])
+st.caption("Tip: if your broker export has different headers, upload it anyway — the normalizer maps common variants automatically.")
 
-ev_table = compute_ev_table(positions, catalysts)
 
-# -----------------------------
-# DISPLAY — PORTFOLIO
-# -----------------------------
-c1, c2 = st.columns([1, 2], gap="large")
+# --------------------------- Footer ---------------------------
 
-with c1:
-    st.subheader("Positions")
-    if positions.empty:
-        st.info("No positions uploaded yet.")
-    else:
-        # Recompute effective display price
-        pos = positions.copy()
-        pos["price"] = pos.apply(_effective_price, axis=1)
-        pos["mv"] = pos["qty"] * pos["price"]
-        pos = _coerce_numeric(pos, ["qty","avg","price","mv"])
-        st.dataframe(pos, use_container_width=True, hide_index=True)
-
-with c2:
-    st.subheader("Catalysts (EV computed)")
-    if ev_table.empty:
-        st.info("No catalyst data uploaded yet.")
-    else:
-        st.dataframe(ev_table, use_container_width=True, hide_index=True)
-
-# -----------------------------
-# SHORT-FUSE PANEL
-# -----------------------------
-st.markdown("---")
-st.subheader("⚡ Short-Fuse (DTE ≤ 15 & (EV% ≥ threshold or Confidence ≥ threshold))")
-if ev_table.empty:
-    st.info("Upload catalyst CSV to view Short-Fuse ideas.")
-else:
-    sf = ev_table.copy()
-    sf = sf[(sf["DTE"].fillna(9999) <= 15) & (
-            (sf["EV_pct"].fillna(-1e9) >= ev_threshold) |
-            (sf["confidence"].fillna(0.0) >= conf_threshold)
-        )]
-    if sf.empty:
-        st.info("No items meet Short-Fuse criteria at the moment.")
-    else:
-        st.dataframe(sf, use_container_width=True, hide_index=True)
-
-# -----------------------------
-# SUGGESTED ALLOCATION (simple EV% rank within budget)
-# -----------------------------
-st.markdown("---")
-st.subheader("Suggested Allocation (EV%-weighted, budget constrained)")
-
-def suggest_alloc(ev_df, budget_eur, max_n=5):
-    df = ev_df.copy()
-    df = df[np.isfinite(df["EV_pct"]) & np.isfinite(df["price"]) & (df["price"] > 0)]
-    if df.empty or budget_eur <= 0:
-        return pd.DataFrame(columns=["ticker","price","EV_pct","suggest_shares","alloc_eur"])
-
-    # Rank by EV% then by sooner DTE
-    df = df.sort_values(["EV_pct","DTE"], ascending=[False, True]).head(max_n)
-
-    # Normalize weights by EV% (positive only)
-    df["w_raw"] = df["EV_pct"].clip(lower=0.0)
-    if df["w_raw"].sum() <= 0:
-        df["w"] = 1.0 / len(df)
-    else:
-        df["w"] = df["w_raw"] / df["w_raw"].sum()
-
-    df["alloc_eur"] = df["w"] * budget_eur
-    df["suggest_shares"] = np.floor(df["alloc_eur"] / df["price"]).astype(int)
-    df["alloc_eur"] = df["suggest_shares"] * df["price"]
-
-    out = df[["ticker","price","EV_pct","suggest_shares","alloc_eur"]]
-    # Remove zeros
-    out = out[out["suggest_shares"] > 0]
-    return out
-
-alloc = suggest_alloc(ev_table, budget, int(max_positions))
-if alloc.empty:
-    st.info("No allocation suggestion (check EV% & prices).")
-else:
-    st.dataframe(alloc, use_container_width=True, hide_index=True)
-    st.caption("Tip: Use limit or bracket orders; tighten stops on leverage per your LCM rules.")
-
-# -----------------------------
-# FOOTER
-# -----------------------------
-st.markdown("""
----
-**Notes**
-- EV/sh = p_bull·t_bull + p_base·t_base + p_bear·t_bear. EV% is relative to current effective price (live quote if enabled, else CSV price/avg).
-- CSVs are flexible — the app auto-maps columns like `symbol→ticker`, `average_cost→avg`.  
-- Live quotes are cached 5 minutes to keep things snappy. Disable them if first load is slow.
-""")
+st.divider()
+st.caption(
+    "Educational only. Not investment advice. Quotes via yfinance (cached 15 min) when enabled; "
+    "otherwise EV uses provided/positions prices."
+)
