@@ -1,274 +1,285 @@
-# app.py — Catalyst Copilot v0.2.1 (hardened)
-# - Adds zoneinfo fallback
-# - Stricter input sanitization
-# - Defensive probability normalization
-# - Clear error messages instead of silent crashes
+# app.py — Catalyst Copilot v0.3 (CSV ingest + per-position EV + reinvest plan)
+# Minimal deps: streamlit, pandas, numpy
 
-from datetime import datetime, date
 import math
-import os
+import io
+import datetime as dt
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- Timezone safe import ----------
-# Some runtimes don’t ship zoneinfo. Fall back to naive local time.
-try:
-    from zoneinfo import ZoneInfo  # py>=3.9
-    TZ = ZoneInfo("Europe/Berlin")
-    def today_local():
-        return datetime.now(TZ).date()
-except Exception:
-    TZ = None
-    def today_local():
-        # Fallback: naive local date
-        return datetime.now().date()
+st.set_page_config(page_title="Catalyst Copilot", layout="wide")
+st.title("⚗️ Catalyst Copilot — v0.3")
 
-TODAY = today_local()
-
-# ---------- Streamlit page ----------
-st.set_page_config(page_title="Catalyst Copilot v0.2.1", layout="wide")
-st.title("Catalyst Copilot v0.2.1")
-st.caption("Portfolio → Catalyst cards → EV math → Ranked watchlist (hardened build).")
-
-# ---------- Helpers ----------
-def safe_float(x, default=0.0):
-    """Cast to float safely; handles '', None, commas, spaces."""
-    try:
-        if x is None:
-            return default
-        if isinstance(x, (int, float)):
-            return float(x)
-        s = str(x).strip().replace(",", "")
-        if s == "":
-            return default
-        return float(s)
-    except Exception:
-        return default
-
-def compute_dte(event_date: date) -> int:
-    try:
-        return (event_date - TODAY).days
-    except Exception:
-        return 0
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def clip(x, lo, hi):
     return max(lo, min(hi, x))
 
-def normalize_probs(p_bull, p_base, p_bear):
-    ps = [safe_float(p_bull, 0.0), safe_float(p_base, 0.0), safe_float(p_bear, 0.0)]
-    s = sum(ps)
-    if s <= 0:
-        # default priors
-        return 0.35, 0.45, 0.20
-    pn = [max(0.0, p) / s for p in ps]
-    # guard for floating drift
-    total = sum(pn)
-    if total <= 0:
-        return 0.35, 0.45, 0.20
-    # rescale to exactly 1.0
-    pn = [p / total for p in pn]
-    return round(pn[0], 3), round(pn[1], 3), round(pn[2], 3)
+def dte(date_str: str) -> int:
+    try:
+        d = dt.datetime.fromisoformat(date_str.replace("/", "-"))
+        return max((d.date() - dt.date.today()).days, 0)
+    except Exception:
+        return 0
 
-def compute_ev_per_share(p_bull, p_base, p_bear, t_bull, t_base, t_bear, px_now):
-    px = safe_float(px_now, 0.0)
-    if px <= 0:
-        return 0.0, 0.0
-    # EV% relative to current price
-    ev_pct = (
-        safe_float(p_bull) * (safe_float(t_bull)/px - 1.0) +
-        safe_float(p_base) * (safe_float(t_base)/px - 1.0) +
-        safe_float(p_bear) * (safe_float(t_bear)/px - 1.0)
-    )
-    ev_abs = ev_pct * px  # absolute €/share notionally
-    return ev_pct, ev_abs
+def money(x): 
+    try: return f"{x:,.2f}"
+    except: return "-"
 
-def compute_csi(ivz, volz, news=0.0, flow=0.0):
-    return (
-        0.4 * safe_float(ivz) +
-        0.3 * safe_float(volz) +
-        0.2 * clip(safe_float(news), 0.0, 1.0) +
-        0.1 * clip(safe_float(flow), 0.0, 1.0)
-    )
+def pct(x):
+    try: return f"{100*x:,.1f}%"
+    except: return "-"
 
-# ---------- Session state ----------
-if "positions" not in st.session_state:
-    st.session_state.positions = []  # list of dicts
+def normalize_ticker(t):
+    return (t or "").strip().upper()
+
+# -----------------------------
+# Session state init
+# -----------------------------
+if "cash" not in st.session_state: st.session_state.cash = 0.0
+if "positions" not in st.session_state: 
+    # positions keyed by ticker
+    st.session_state.positions: Dict[str, Dict] = {}
 if "cards" not in st.session_state:
-    st.session_state.cards = []      # list of dicts
-if "cash" not in st.session_state:
-    st.session_state.cash = 0.0
+    st.session_state.cards: List[Dict] = []
 
-# ---------- Sidebar: Portfolio ----------
+# -----------------------------
+# Left: Portfolio + CSV ingest
+# -----------------------------
 with st.sidebar:
-    st.header("Portfolio")
+    st.subheader("Portfolio")
+    cash = st.number_input("Cash (€)", min_value=0.0, value=float(st.session_state.cash), step=50.0)
+    if st.button("Save Cash"): 
+        st.session_state.cash = cash
+        st.success("Cash saved")
 
-    cash_in = st.text_input("Cash (€)", value=str(st.session_state.cash or "0"))
-    if st.button("Save Cash", use_container_width=True):
-        st.session_state.cash = safe_float(cash_in, 0.0)
-        st.success(f"Cash set to €{st.session_state.cash:,.2f}")
-
+    st.markdown("---")
     st.subheader("Add / Update Position")
-    colp1, colp2 = st.columns(2)
-    with colp1:
-        px_ticker = st.text_input("Ticker", value="")
-        px_shares = st.text_input("Shares", value="0")
-    with colp2:
-        px_avg = st.text_input("Avg Cost", value="0")
-        px_price = st.text_input("Current Price", value="0")
-
-    if st.button("Add/Update Position", type="primary", use_container_width=True):
-        t = (px_ticker or "").strip().upper()
-        if not t:
-            st.error("Ticker is required.")
+    tkr = st.text_input("Ticker", value="")
+    avg = st.number_input("Avg Cost", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+    sh  = st.number_input("Shares", min_value=0, value=0, step=1)
+    px  = st.number_input("Current Price", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+    if st.button("Add/Update Position"):
+        T = normalize_ticker(tkr)
+        if T and sh>0:
+            st.session_state.positions[T] = {"ticker":T, "avg":avg, "shares":int(sh), "price":px}
+            st.success(f"Position saved: {T}")
         else:
-            upsert = {
-                "ticker": t,
-                "shares": safe_float(px_shares, 0.0),
-                "avg_cost": safe_float(px_avg, 0.0),
-                "price": safe_float(px_price, 0.0),
-            }
-            found = False
-            for p in st.session_state.positions:
-                if p["ticker"] == t:
-                    p.update(upsert)
-                    found = True
-                    break
-            if not found:
-                st.session_state.positions.append(upsert)
-            st.success(f"Saved position: {t}")
+            st.warning("Please enter ticker and shares > 0")
 
-    if st.button("Clear Positions", use_container_width=True):
-        st.session_state.positions = []
-        st.info("Positions cleared.")
+    if st.button("Clear Positions"):
+        st.session_state.positions.clear()
+        st.info("Positions cleared")
 
-# ---------- Positions ----------
-st.subheader("Positions")
-if st.session_state.positions:
-    dfp = pd.DataFrame(st.session_state.positions)
-    # Fill missing numeric fields safely
-    for col in ["shares", "avg_cost", "price"]:
-        dfp[col] = dfp[col].apply(lambda x: safe_float(x, 0.0))
-    dfp["MV"] = dfp["shares"] * dfp["price"]
-    st.dataframe(dfp, use_container_width=True)
-    st.markdown(
-        f"**Cash:** €{st.session_state.cash:,.2f} | "
-        f"**MV:** €{dfp['MV'].sum():,.2f} | "
-        f"**NLV (approx):** €{(dfp['MV'].sum() + st.session_state.cash):,.2f}"
-    )
-else:
-    st.info("Add positions in the sidebar to see MV / NLV.")
+    st.markdown("---")
+    st.subheader("📥 Import from IBKR / broker CSV")
+    """
+    Accepted columns (any of):  
+    - **Ticker/Symbol**, **Quantity/Shares/Position**, **Average Cost/Avg Price**, **Price/Mark Price/Close**  
+    Export from **IBKR > PortfolioAnalyst > Positions (CSV)**.
+    """
+    up = st.file_uploader("Upload CSV", type=["csv"])
 
-st.divider()
+    def auto_map_cols(df: pd.DataFrame) -> pd.DataFrame:
+        cols = {c.lower().strip(): c for c in df.columns}
+        # Try mappings
+        sym = next((cols[k] for k in cols if k in ["symbol","ticker","underlying"]), None)
+        qty = next((cols[k] for k in cols if k in ["quantity","shares","position"]), None)
+        avgc= next((cols[k] for k in cols if k in ["average cost","avg price","costbasis","cost basis","avg cost"]), None)
+        prc = next((cols[k] for k in cols if k in ["mark price","price","close","last price","market price"]), None)
 
-# ---------- Catalyst Card Form ----------
-st.subheader("Add Catalyst Card")
-with st.form("card_form", clear_on_submit=True):
-    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
-    with c1:
-        c_ticker = st.text_input("Ticker*", "")
-        c_type = st.selectbox("Type*", ["PDUFA","CHMP","Readout","Earnings","Policy","APD","Conf","Other"])
-        c_date = st.date_input("Event Date*", value=TODAY)
-    with c2:
-        c_price = st.text_input("Current Price*", "0")
-        c_target_bull = st.text_input("Target Bull*", "0")
-        c_target_base = st.text_input("Target Base*", "0")
-        c_target_bear = st.text_input("Target Bear*", "0")
-    with c3:
-        c_p_bull = st.text_input("p_bull*", "0.35")
-        c_p_base = st.text_input("p_base*", "0.45")
-        c_p_bear = st.text_input("p_bear*", "0.20")
-        c_conf = st.slider("Confidence (0–1)", 0.0, 1.0, 0.60, 0.01)
-    with c4:
-        c_ivz = st.text_input("IV z", "0")
-        c_volz = st.text_input("Vol z", "0")
-        c_news = st.text_input("News score (0–1)", "0")
-        c_flow = st.text_input("Flow score (0–1)", "0")
+        missing = [n for n,v in [("Ticker",sym),("Shares",qty),("Avg",avgc),("Price",prc)] if v is None]
+        if missing: 
+            st.warning(f"Missing columns in CSV: {', '.join(missing)}. Showing detected columns instead.")
+        out = pd.DataFrame()
+        if sym is not None:  out["ticker"] = df[sym].astype(str).map(normalize_ticker)
+        if qty is not None:  out["shares"] = pd.to_numeric(df[qty], errors="coerce").fillna(0).astype(int)
+        if avgc is not None: out["avg"]    = pd.to_numeric(df[avgc], errors="coerce").fillna(0.0)
+        if prc is not None:  out["price"]  = pd.to_numeric(df[prc], errors="coerce").fillna(0.0)
+        return out.dropna(subset=["ticker"]).query("ticker != ''")
 
-    submitted = st.form_submit_button("Add Card")
-    if submitted:
+    if up is not None:
         try:
-            # Normalize probabilities robustly
-            p_bull, p_base, p_bear = normalize_probs(c_p_bull, c_p_base, c_p_bear)
-
-            price_now = safe_float(c_price, 0.0)
-            t_bull = safe_float(c_target_bull, 0.0)
-            t_base = safe_float(c_target_base, 0.0)
-            t_bear = safe_float(c_target_bear, 0.0)
-
-            ivz = safe_float(c_ivz, 0.0)
-            volz = safe_float(c_volz, 0.0)
-            news = clip(safe_float(c_news, 0.0), 0.0, 1.0)
-            flow = clip(safe_float(c_flow, 0.0), 0.0, 1.0)
-
-            dte = compute_dte(c_date if isinstance(c_date, date) else TODAY)
-            ev_pct, ev_abs = compute_ev_per_share(p_bull, p_base, p_bear, t_bull, t_base, t_bear, price_now)
-            csi = compute_csi(ivz, volz, news, flow)
-
-            t_sym = (c_ticker or "").strip().upper()
-            if not t_sym:
-                raise ValueError("Ticker is required.")
-
-            st.session_state.cards.append({
-                "ticker": t_sym,
-                "type": c_type,
-                "date": c_date.isoformat() if isinstance(c_date, date) else str(c_date),
-                "dte": dte,
-                "price": price_now,
-                "t_bull": t_bull,
-                "t_base": t_base,
-                "t_bear": t_bear,
-                "p_bull": p_bull,
-                "p_base": p_base,
-                "p_bear": p_bear,
-                "ev_pct": ev_pct,
-                "ev_abs": ev_abs,
-                "conf": round(safe_float(c_conf, 0.6), 2),
-                "ivz": ivz,
-                "volz": volz,
-                "news": news,
-                "flow": flow,
-                "csi": csi,
-            })
-            st.success("Catalyst card added.")
+            raw = pd.read_csv(up)
+            mapped = auto_map_cols(raw)
+            for _, r in mapped.iterrows():
+                if r.get("shares",0) > 0:
+                    st.session_state.positions[r["ticker"]] = {
+                        "ticker": r["ticker"],
+                        "avg": float(r.get("avg",0.0)),
+                        "shares": int(r.get("shares",0)),
+                        "price": float(r.get("price",0.0)),
+                    }
+            st.success(f"Imported {len(mapped)} positions.")
         except Exception as e:
-            st.error(f"Error adding card: {e}")
+            st.error(f"CSV parse error: {e}")
 
-# ---------- Watchlist / Ranking ----------
-st.subheader("Catalyst Watchlist (ranked)")
-if st.session_state.cards:
-    df = pd.DataFrame(st.session_state.cards).copy()
+# -----------------------------
+# Center: Catalyst Cards
+# -----------------------------
+st.markdown("### Catalyst Cards — add & rank")
 
-    # Defensive typing
-    for col in ["dte","price","t_bull","t_base","t_bear","p_bull","p_base","p_bear","ev_pct","csi","conf"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+col0, col1, col2, col3, col4, col5, col6 = st.columns([1.2,1,1,1,1,1,1])
 
-    # time decay → nearer events rank higher (no negatives)
-    df["time_decay"] = 1.0 / (1.0 + df["dte"].clip(lower=0))
-    # final score
-    df["score"] = df["csi"] * df["time_decay"] * (1.0 + df["ev_pct"])
+with col0:
+    cat_type = st.selectbox("Type", ["PDUFA","CHMP","Readout","Earnings","Policy","Conf","APD","Other"])
+with col1:
+    target_bull = st.number_input("Target Bull*", min_value=0.0, value=0.0, step=0.1)
+with col2:
+    target_base = st.number_input("Target Base*", min_value=0.0, value=0.0, step=0.1)
+with col3:
+    target_bear = st.number_input("Target Bear*", min_value=0.0, value=0.0, step=0.1)
+with col4:
+    p_bear = st.number_input("p_bear*", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
+with col5:
+    news = st.number_input("News score (0–1)", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
+with col6:
+    flow = st.number_input("Flow score (0–1)", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
 
-    df = df.sort_values(["score"], ascending=False)
+c1, c2, c3 = st.columns(3)
+with c1:
+    tkr_in = st.text_input("Ticker*", value="")
+with c2:
+    date_in = st.date_input("Event Date*", value=dt.date.today() + dt.timedelta(days=10))
+with c3:
+    conf = st.slider("Confidence (0–1)", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
 
+p_bull = clip(1.0 - p_bear - 0.45, 0.05, 0.9)   # simple prior split
+p_base = clip(1.0 - p_bear - p_bull, 0.05, 0.9)
+
+if st.button("Add Card"):
+    T = normalize_ticker(tkr_in)
+    if not T:
+        st.warning("Please enter ticker.")
+    else:
+        card = {
+            "ticker": T,
+            "type": cat_type,
+            "date": str(date_in),
+            "dte": dte(str(date_in)),
+            "t_bull": float(target_bull),
+            "t_base": float(target_base),
+            "t_bear": float(target_bear),
+            "p_bull": float(p_bull),
+            "p_base": float(p_base),
+            "p_bear": float(p_bear),
+            "conf": float(conf),
+            "news": float(news), 
+            "flow": float(flow),
+        }
+        st.session_state.cards.append(card)
+        st.success(f"Card added for {T}")
+
+# -----------------------------
+# Rank catalysts
+# -----------------------------
+cards_df = pd.DataFrame(st.session_state.cards)
+if not cards_df.empty:
+    # MathOdds (simple): weighted probs + recency & soft signal
+    recency = np.exp(-cards_df["dte"]/30.0)
+    odds = (0.5*cards_df["p_bull"] + 0.35*cards_df["p_base"] + 0.15*(1-cards_df["p_bear"])) \
+           * (0.6*cards_df["conf"] + 0.2*cards_df["news"] + 0.2*cards_df["flow"]) \
+           * (0.5 + 0.5*recency)
+    # EV%
+    # price may come from positions if we have it, else assume t_base for display
+    prices = []
+    for _, r in cards_df.iterrows():
+        P = st.session_state.positions.get(r["ticker"], {})
+        px = float(P.get("price", r["t_base"] or 0.0))
+        prices.append(px if px>0 else 0.0)
+    prices = np.array(prices)
+    ev_sh = (cards_df["p_bull"]*cards_df["t_bull"] + cards_df["p_base"]*cards_df["t_base"] + cards_df["p_bear"]*cards_df["t_bear"]) - prices
+    ev_pct = np.where(prices>0, ev_sh/prices, 0.0)
+
+    cards_df = cards_df.assign(price=prices, ev_pct=ev_pct, odds=odds)
+    cards_df = cards_df.sort_values(["odds","ev_pct"], ascending=False, ignore_index=True)
+
+    st.markdown("#### Catalyst Watchlist (ranked)")
     st.dataframe(
-        df[[
-            "ticker","type","date","dte","price",
-            "t_bull","t_base","t_bear",
-            "p_bull","p_base","p_bear",
-            "ev_pct","csi","conf","score"
-        ]],
-        use_container_width=True
+        cards_df[["ticker","type","date","dte","price","t_bull","t_base","t_bear","p_bull","p_base","p_bear","ev_pct","odds"]],
+        use_container_width=True, height=320
     )
 
-    st.download_button(
-        "Download watchlist as CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"catalyst_watchlist_{TODAY.isoformat()}.csv",
-        mime="text/csv"
-    )
+    csv_buf = io.StringIO()
+    cards_df.to_csv(csv_buf, index=False)
+    st.download_button("Download watchlist as CSV", data=csv_buf.getvalue(), file_name="watchlist.csv", mime="text/csv")
 else:
-    st.info("Add a catalyst card to see the ranked watchlist.")
+    st.info("Add a catalyst card to see rankings.")
 
-st.divider()
-st.caption("v0.2.1 — hardened. Next: broker CSV ingest, per-position EV, reinvest plan, order ticket helpers.")
+# -----------------------------
+# Right: Portfolio EV + Reinvest plan
+# -----------------------------
+st.markdown("---")
+st.markdown("### 📈 Portfolio — EV & Reinvest Plan")
+
+# Build positions table with EV per position using best matching card per ticker
+pos_df = pd.DataFrame(list(st.session_state.positions.values()))
+if not pos_df.empty:
+    # map card by ticker (best ranked)
+    best = {}
+    if not cards_df.empty:
+        for t in cards_df["ticker"].unique():
+            best[t] = cards_df[cards_df["ticker"]==t].iloc[0].to_dict()
+
+    ev_perc_list, ev_abs_list = [], []
+    for _, r in pos_df.iterrows():
+        px = float(r.get("price",0.0))
+        t = r["ticker"]
+        if t in best and px>0:
+            b = best[t]
+            ev_sh = (b["p_bull"]*b["t_bull"] + b["p_base"]*b["t_base"] + b["p_bear"]*b["t_bear"]) - px
+            ev_pct = ev_sh/px
+        else:
+            ev_pct = 0.0
+            ev_sh = 0.0
+        ev_perc_list.append(ev_pct)
+        ev_abs_list.append(ev_sh * float(r.get("shares",0)))
+    pos_df["EV_%"] = ev_perc_list
+    pos_df["EV_€"] = ev_abs_list
+    pos_df["MktVal€"] = pos_df["price"] * pos_df["shares"]
+
+    left, right = st.columns([1.2,1])
+    with left:
+        st.dataframe(
+            pos_df[["ticker","shares","avg","price","MktVal€","EV_%","EV_€"]],
+            use_container_width=True, height=260
+        )
+    with right:
+        total_mv = pos_df["MktVal€"].sum()
+        total_ev = pos_df["EV_€"].sum()
+        st.metric("Market Value (€)", money(total_mv))
+        st.metric("Sum EV (€)", money(total_ev))
+        st.metric("Cash (€)", money(st.session_state.cash))
+
+    # Reinvest plan — allocate a fraction of cash to top catalysts not already held
+    st.markdown("#### 🔁 Reinvest Planner")
+    r = st.slider("Reinvest rate r (0–100%)", 0, 100, 60, step=5) / 100.0
+    budget = st.session_state.cash * r
+    st.write(f"Budget: **€{money(budget)}**")
+
+    if not cards_df.empty and budget>0:
+        # candidates = top 5 not held
+        held = set(pos_df["ticker"].tolist())
+        cands = cards_df[~cards_df["ticker"].isin(held)].head(5).copy()
+        # naive sizing: proportional to odds*ev_pct, price-aware
+        w = (cands["odds"].clip(1e-6) * (cands["ev_pct"].clip(lower=0)+1e-6))
+        w = w / w.sum()
+        target_euros = w * budget
+        buy_shares = (target_euros / cands["price"]).fillna(0).astype(int).clip(lower=0)
+        plan = cands[["ticker","price","ev_pct","odds"]].copy()
+        plan["alloc€"] = target_euros.round(2)
+        plan["buy_shares"] = buy_shares
+        st.dataframe(plan, use_container_width=True)
+        st.caption("Sizing = proportional to (odds × EV%) under cash budget; refine later with PRB.")
+    else:
+        st.info("Need budget > 0 and at least one catalyst not already held.")
+
+else:
+    st.info("No positions yet. Add manually or upload a broker CSV.")
+
+st.caption("v0.3 — CSV ingest, per-position EV, reinvest planner. Next: order tickets & historical backtest.")
